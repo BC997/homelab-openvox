@@ -1,0 +1,4 @@
+*.eyaml
+*.pem
+r10k.yaml
+.env

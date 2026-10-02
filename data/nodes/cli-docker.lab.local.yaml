@@ -1,0 +1,19 @@
+---
+profile::prometheus_env::pve_user: "Prometheus@pve"
+profile::prometheus_env::pve_verify_ssl: "false"
+profile::pihole_env::tz: "America/Los_Angeles"
+profile::pihole_env::ftl_webserver_port: "8080"
+# arr_stack configuration
+profile::arr_stack::puid: '1026'
+profile::arr_stack::pgid: '100'
+profile::arr_stack::timezone: 'America/Los_Angeles'
+profile::arr_stack::media_path: '/mnt/nas/plexmediaserver'
+profile::arr_stack::sonarr_port: '8082'
+profile::arr_stack::radarr_port: '7878'
+profile::arr_stack::abs_port: '90'
+profile::arr_stack::compose_user: 'ubuntu'
+profile::arr_stack::compose_dir: '/home/ubuntu/docker/arrs'
+# Allow Docker's internal bridge networks (hairpin NAT traffic when
+# containers reach other services via the host's LAN IP)
+profile::base::firewall_extra_allow:
+  - '172.16.0.0/12'

@@ -1,0 +1,8 @@
+---
+profile::plex::upgrade_hour: 3
+profile::plex::upgrade_minute: 0
+profile::plex::upgrade_log: "/var/log/plex-upgrade.log"
+profile::plex::restart_sec: 10
+profile::node_exporter::version: "1.8.1"
+base::puppet_agent_config::server: 'openvox-cli.lab.local'
+base::puppetdb_conf::server_urls: 'https://openvox-cli.lab.local:8081'

@@ -1,0 +1,9 @@
+# Managed by Puppet (base::puppet_agent_config) — DO NOT EDIT MANUALLY
+[main]
+<% if scope['::trusted']['certname'] == 'puppet.lab.local' -%>
+ssldir = /var/lib/puppet/ssl
+<% end -%>
+certname = <%= scope['::trusted']['certname'] %>
+server = <%= @server %>
+environment = production
+reports = store,puppetdb

@@ -1,0 +1,6 @@
+---
+profile::node_exporter::extra_args: "--collector.systemd --collector.systemd.unit-include=plexmediaserver.service"
+# Allow public inbound access to Plex's streaming port only;
+# everything else on this node stays LAN-only
+profile::base::firewall_extra_ports:
+  - '32400'
