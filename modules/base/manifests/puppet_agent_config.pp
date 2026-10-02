@@ -1,7 +1,7 @@
 # Manages /etc/puppetlabs/puppet/puppet.conf so every agent has consistent
 # configuration including PuppetDB integration (storeconfigs + reports).
 class base::puppet_agent_config (
-  String $server = 'puppet.lab.local',
+  String $server = 'openvox-cli.lab.local',
 ) {
   file { '/etc/puppetlabs/puppet/puppet.conf':
     ensure  => file,

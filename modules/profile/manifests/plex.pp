@@ -1,4 +1,9 @@
-class profile::plex {
+class profile::plex (
+  Integer $upgrade_hour   = 3,
+  Integer $upgrade_minute = 0,
+  String  $upgrade_log    = '/var/log/plex-upgrade.log',
+  Integer $restart_sec    = 10,
+) {
   # Plex GPG key (v2 - required for PMS 1.43.0+)
   exec { 'add-plex-gpg-key':
     command => '/bin/curl -L https://downloads.plex.tv/plex-keys/PlexSign.v2.key | /usr/bin/gpg --yes --dearmor -o /etc/apt/keyrings/plexmediaserver.v2.gpg',
@@ -21,10 +26,10 @@ class profile::plex {
     require => File['/etc/apt/sources.list.d/plex.list'],
   }
   cron { 'plex-upgrade':
-    command => 'apt-get update && apt-get install --only-upgrade plexmediaserver -y >> /var/log/plex-upgrade.log 2>&1',
+    command => "apt-get update && apt-get install --only-upgrade plexmediaserver -y >> ${upgrade_log} 2>&1",
     user    => 'root',
-    hour    => 3,
-    minute  => 0,
+    hour    => $upgrade_hour,
+    minute  => $upgrade_minute,
     require => Package['plexmediaserver'],
   }
   # systemd override for auto-restart
@@ -35,7 +40,7 @@ class profile::plex {
   }
   file { '/etc/systemd/system/plexmediaserver.service.d/override.conf':
     ensure  => present,
-    content => "[Service]\nRestart=on-failure\nRestartSec=10\n",
+    content => "[Service]\nRestart=on-failure\nRestartSec=${restart_sec}\n",
     owner   => 'root',
     group   => 'root',
     require => File['/etc/systemd/system/plexmediaserver.service.d'],

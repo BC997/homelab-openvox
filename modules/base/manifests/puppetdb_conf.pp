@@ -1,7 +1,7 @@
 # Manages /etc/puppetlabs/puppet/puppetdb.conf so every agent points at
 # PuppetDB's FQDN (not the short hostname) for SSL hostname verification.
 class base::puppetdb_conf (
-  String $server_urls = 'https://puppetdb.lab.local:8081',
+  String $server_urls = 'https://openvox-cli.lab.local:8081',
 ) {
   file { '/etc/puppetlabs/puppet/puppetdb.conf':
     ensure  => file,

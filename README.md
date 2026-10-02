@@ -4,6 +4,19 @@ The configuration code behind my homelab. OpenVox 8 (the community fork of Open 
 
 This is a sanitized public copy of the internal repo. Architecture notes, runbooks, and lessons learned live in [homelab-docs](https://github.com/BC997/homelab-docs).
 
+## Start here
+
+| File | Why it is worth a look |
+|---|---|
+| [manifests/site.pp](manifests/site.pp) | How each VM is classified |
+| [modules/profile/manifests/base.pp](modules/profile/manifests/base.pp) | Fleet baseline, Hiera driven admin user, explicit absent branch |
+| [modules/base/manifests/firewall.pp](modules/base/manifests/firewall.pp) | ufw with default deny and per node exceptions, all idempotent |
+| [modules/base/manifests/packages.pp](modules/base/manifests/packages.pp) | Pinned fail2ban workaround for Ubuntu 24.04 |
+| [modules/profile/manifests/arr_stack.pp](modules/profile/manifests/arr_stack.pp) | Compose stack rendered from a template, recreated only on change |
+| [modules/profile/manifests/plex.pp](modules/profile/manifests/plex.pp) | Package, repo, upgrade cron, and systemd override driven by Hiera |
+| [hiera.yaml](hiera.yaml) | Lookup order with encrypted data above plain data |
+| [docs/openvox-master-setup.sh](docs/openvox-master-setup.sh) | Server side changes from the OpenVox migration |
+
 ## Layout
 
     manifests/site.pp            Node classification
