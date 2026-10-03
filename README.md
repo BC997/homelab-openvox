@@ -9,13 +9,14 @@ This is a sanitized public copy of the internal repo. Architecture notes, runboo
 | File | Why it is worth a look |
 |---|---|
 | [manifests/site.pp](manifests/site.pp) | How each VM is classified |
+| [modules/profile/manifests/openvox_primary.pp](modules/profile/manifests/openvox_primary.pp) | Self healing server fixes on the primary, with a check and apply helper script |
 | [modules/profile/manifests/base.pp](modules/profile/manifests/base.pp) | Fleet baseline, Hiera driven admin user, explicit absent branch |
 | [modules/base/manifests/firewall.pp](modules/base/manifests/firewall.pp) | ufw with default deny and per node exceptions, all idempotent |
 | [modules/base/manifests/packages.pp](modules/base/manifests/packages.pp) | Pinned fail2ban workaround for Ubuntu 24.04 |
 | [modules/profile/manifests/arr_stack.pp](modules/profile/manifests/arr_stack.pp) | Compose stack rendered from a template, recreated only on change |
 | [modules/profile/manifests/plex.pp](modules/profile/manifests/plex.pp) | Package, repo, upgrade cron, and systemd override driven by Hiera |
 | [hiera.yaml](hiera.yaml) | Lookup order with encrypted data above plain data |
-| [docs/openvox-master-setup.sh](docs/openvox-master-setup.sh) | Server side changes from the OpenVox migration |
+| [docs/openvox-master-setup.sh](docs/openvox-master-setup.sh) | Bootstrap for a fresh primary, before Puppet takes over |
 
 ## Layout
 
@@ -36,7 +37,7 @@ This is a sanitized public copy of the internal repo. Architecture notes, runboo
 | role::standard_server | profile::base |
 | role::media_server | profile::base, profile::plex |
 
-The Docker host adds service profiles in site.pp on top of its role.
+The Docker host adds service profiles in site.pp on top of its role, and the primary adds `profile::openvox_primary`.
 
 **Hiera for everything that varies.** Firewall exceptions, ports, user and group IDs, paths, and agent server settings all come from Hiera. Encrypted values (eyaml) sit above plain values at each level, and per node data sits above common data.
 
@@ -48,15 +49,21 @@ The Docker host adds service profiles in site.pp on top of its role.
 
 **Working around upstream bugs in code.** fail2ban 1.0.2 on Ubuntu 24.04 breaks under Python 3.12, so `base::packages` installs the upstream 1.1.0 package on noble and holds it.
 
+**Self healing server fixes.** The primary needs a few settings that live outside normal Puppet paths: OpenVoxDB routes, a metrics access rule, the autosign allowlist, and two PuppetBoard code patches. `profile::openvox_primary` enforces all of them. A small helper script has a `check` mode and an `apply` mode for each fix, and Puppet only runs `apply` when `check` reports the fix is missing. If a package upgrade undoes one, the next agent run puts it back and restarts only the affected service. If an upgrade changes the code a patch expects, `apply` fails loudly instead of guessing, so the run shows as failed in PuppetBoard. This was tested by undoing a fix by hand and watching the next run repair it.
+
+**Enforcing what already works.** `base::time` keeps Ubuntu's built in `systemd-timesyncd` enabled and running on every node. Chrony was evaluated and dropped, since timesyncd already holds sub millisecond offsets.
+
 **Explicit state removal.** When a feature is turned off in Hiera, the profile sets `ensure => absent` instead of just skipping the resource. Skipping would leave an already applied resource in place. The nightly reboot cron is the example here.
 
 ## Secrets
 
 No secrets are in this repo. The internal repo keeps them in eyaml files encrypted with a PKCS7 keypair that never leaves the primary. Those files are excluded here, so parameters such as `pve_password`, `webpassword`, and `plex_token` show their empty defaults. The admin user name and SSH key are also Hiera parameters.
 
-## Migration scripts
+No access tokens are used either. r10k pulls with a read only SSH deploy key scoped to this one repo, and edits are pushed with a separate SSH key. Before the old token was revoked, every place that used it was found and moved first, so nothing broke.
 
-`docs/` holds the server side changes made when moving from Open Source Puppet to OpenVox. These cover settings that live outside Puppet managed paths on the primary: code directory, OpenVoxDB routes, autosign allowlist, and PuppetBoard patches. Codifying them into a profile is on the roadmap.
+## Bootstrap scripts
+
+`docs/` holds the server side changes made when moving from Open Source Puppet to OpenVox. `profile::openvox_primary` now enforces almost all of them, so the scripts are only needed to bring up a fresh primary before its first agent run. The one setting Puppet cannot own is `server-code-dir`: if it is wrong, the server cannot load any code, including the profile that would fix it.
 
 ## Sanitization
 

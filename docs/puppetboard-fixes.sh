@@ -1,6 +1,10 @@
 #!/bin/bash
 # PuppetBoard fixes for OpenVox — required after fresh install or package upgrade
 # Documented Aug 18-19, 2026 during OpenVox migration
+# Since Oct 2026, profile::openvox_primary enforces routes.yaml, autosign.conf,
+# the OpenVoxDB auth.conf metrics rule and both PuppetBoard patches on every
+# agent run. This script is only needed to bootstrap a fresh primary before
+# its first agent run.
 set -e
 
 echo "=== Fix 1: routes.yaml — enable facts+catalog submission to OpenVoxDB ==="

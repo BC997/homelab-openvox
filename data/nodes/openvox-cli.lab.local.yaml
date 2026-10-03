@@ -1,2 +1,6 @@
 ---
 profile::base::manage_nightly_reboot: false
+profile::openvox_primary::autosign_certnames:
+  - 'openvox-cli.lab.local'
+  - 'plex-cli.lab.local'
+  - 'cli-docker.lab.local'
