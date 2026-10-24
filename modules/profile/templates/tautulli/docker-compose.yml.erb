@@ -1,0 +1,16 @@
+# Managed by Puppet - profile::tautulli
+# Do not edit manually. Edit Hiera or the template instead.
+services:
+  tautulli:
+    image: lscr.io/linuxserver/tautulli:latest
+    container_name: tautulli
+    environment:
+      - PUID=1026
+      - PGID=100
+      - TZ=America/Los_Angeles
+      - TAUTULLI_PLEX_TOKEN=<%= @plex_token %>
+    volumes:
+      - ./config:/config
+    ports:
+      - <%= @tautulli_port %>:8181
+    restart: unless-stopped

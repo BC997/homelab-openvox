@@ -1,0 +1,6 @@
+# Managed by Puppet (base::puppet_agent_config) — DO NOT EDIT MANUALLY
+[main]
+certname = <%= scope['::trusted']['certname'] %>
+server = <%= @server %>
+environment = production
+reports = store,puppetdb

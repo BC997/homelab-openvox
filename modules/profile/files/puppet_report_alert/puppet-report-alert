@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Send failed Open Source Puppet runs and drift corrections to Home Assistant.
+
+Managed by Open Source Puppet (profile::puppet_report_alert).
+Reads OpenVoxDB on localhost, posts JSON to a LAN only HA webhook.
+A changed report counts as drift when it lands more than DEPLOY_GRACE_MIN
+minutes after the last r10k deploy. Failed runs always alert.
+Each alert carries the full report log, the same lines PuppetBoard shows.
+"""
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+PDB = os.environ.get("PDB_URL", "http://localhost:8080")
+HOOK = os.environ["HA_WEBHOOK_URL"]
+STATE = os.environ.get("STATE_FILE", "/var/lib/puppet-report-alert/last_seen")
+DEPLOY_FILE = os.environ.get("DEPLOY_FILE", "/etc/puppet/code/environments/production/.r10k-deploy.json")
+GRACE = int(os.environ.get("DEPLOY_GRACE_MIN", "45"))
+CODE_DIR = os.path.dirname(DEPLOY_FILE) + "/"
+MAX_LOG = int(os.environ.get("MAX_LOG_CHARS", "3000"))
+
+
+def get(path, query=None):
+    url = PDB + path
+    if query is not None:
+        url += "?" + urllib.parse.urlencode({"query": json.dumps(query)})
+    with urllib.request.urlopen(url, timeout=20) as resp:
+        return json.load(resp)
+
+
+def post(payload):
+    req = urllib.request.Request(
+        HOOK,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
+
+
+def last_deploy():
+    times = []
+    for path in (DEPLOY_FILE, os.path.dirname(DEPLOY_FILE)):
+        try:
+            times.append(os.path.getmtime(path))
+        except OSError:
+            pass
+    return datetime.fromtimestamp(max(times), timezone.utc) if times else None
+
+
+def stamp(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def parse_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def report_logs(rep):
+    logs = rep.get("logs")
+    if isinstance(logs, dict):
+        data = logs.get("data")
+        if data is None and logs.get("href"):
+            data = get(logs["href"])
+        logs = data
+    return logs or []
+
+
+def format_log(entries):
+    lines = []
+    for e in sorted(entries, key=lambda x: x.get("time", "")):
+        try:
+            when = parse_time(e["time"]).astimezone().strftime("%H:%M:%S")
+        except (KeyError, ValueError):
+            when = "--:--:--"
+        source = e.get("source") or ""
+        prefix = "" if source in ("", "Puppet") else source.replace("/Stage[main]/", "") + ": "
+        where = ""
+        if e.get("file"):
+            where = f" ({e['file'].replace(CODE_DIR, '')}:{e.get('line')})"
+        lines.append(f"{when} {e.get('level', '')} {prefix}{e.get('message', '')}{where}")
+    text = "\n".join(lines)
+    if len(text) > MAX_LOG:
+        cut = text[:MAX_LOG].rsplit("\n", 1)[0]
+        hidden = len(lines) - cut.count("\n") - 1
+        text = cut + f"\n... {hidden} more lines, see PuppetBoard"
+    return text
+
+
+def main():
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    if not os.path.exists(STATE):
+        with open(STATE, "w") as fh:
+            fh.write(stamp(datetime.now(timezone.utc)))
+        print("first run, starting from now")
+        return 0
+    with open(STATE) as fh:
+        last = fh.read().strip()
+
+    reports = get("/pdb/query/v4/reports", [
+        "extract", ["certname", "status", "receive_time", "hash", "configuration_version", "logs"],
+        ["and", [">", "receive_time", last],
+         ["or", ["=", "status", "changed"], ["=", "status", "failed"]]],
+    ])
+
+    newest = last
+    for rep in sorted(reports, key=lambda r: r["receive_time"]):
+        host = rep["certname"].split(".")[0]
+        received = parse_time(rep["receive_time"])
+        alert = rep["status"] == "failed"
+        resources = []
+        if not alert:
+            deployed = last_deploy()
+            alert = deployed is None or received - deployed > timedelta(minutes=GRACE)
+            if not alert:
+                print(f"{host}: change within {GRACE} min of a deploy, treated as intentional")
+        if alert:
+            if rep["status"] == "changed":
+                events = get("/pdb/query/v4/events", [
+                    "extract", ["resource_type", "resource_title"],
+                    ["and", ["=", "report", rep["hash"]], ["=", "status", "success"]],
+                ])
+                resources = [f"{e['resource_type']}[{e['resource_title']}]" for e in events]
+            payload = {
+                "host": host,
+                "status": rep["status"],
+                "resources": resources,
+                "version": rep.get("configuration_version") or "",
+                "time": received.astimezone().strftime("%b %-d %H:%M:%S"),
+                "log": format_log(report_logs(rep)),
+            }
+            try:
+                post(payload)
+                print(f"{host}: alert sent ({rep['status']}, {len(resources)} resources)")
+            except Exception as err:  # keep state so the next run retries
+                print(f"{host}: webhook failed: {err}", file=sys.stderr)
+                break
+        newest = max(newest, rep["receive_time"])
+
+    with open(STATE, "w") as fh:
+        fh.write(newest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,14 @@
+# Managed by Puppet - profile::seerr
+# Do not edit manually. Edit Hiera or the template instead.
+services:
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=<%= @timezone %>
+    volumes:
+      - ./config:/app/config
+    ports:
+      - <%= @seerr_port %>:5055
+    restart: unless-stopped

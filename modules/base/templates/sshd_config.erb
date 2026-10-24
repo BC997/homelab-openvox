@@ -1,0 +1,29 @@
+# Managed by Puppet - do not edit manually
+
+Port 22
+Protocol 2
+
+# Authentication
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 20
+MaxSessions 5
+
+# Disable unused auth methods
+KerberosAuthentication no
+GSSAPIAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
+
+# Features
+X11Forwarding no
+AllowTcpForwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Banner /etc/issue.net
+
+# SFTP
+Subsystem sftp /usr/lib/openssh/sftp-server

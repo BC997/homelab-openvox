@@ -1,0 +1,76 @@
+#!/bin/bash
+# Managed by Puppet (profile::openvox_primary). Do not edit by hand.
+#
+# Usage: openvox-primary-fixes <fix> check|apply [puppetboard_dir]
+#   check exits 0 when the fix is missing and needs to be applied
+#   apply puts the fix back, and exits nonzero if the expected text is not found
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+fix="${1:?fix name required}"
+action="${2:?check or apply required}"
+pb="${3:-/opt/puppetboard/venv/lib/python3.12/site-packages/puppetboard}"
+auth=/etc/puppetlabs/puppetdb/conf.d/auth.conf
+
+# replace FILE OLD NEW: exact text swap, fails loudly if OLD is missing
+replace() {
+  python3 - "$1" "$2" "$3" <<'PYEOF'
+import sys
+path, old, new = sys.argv[1:4]
+with open(path) as f:
+    s = f.read()
+if old not in s:
+    sys.exit("expected text not found in " + path)
+with open(path, "w") as f:
+    f.write(s.replace(old, new))
+PYEOF
+}
+
+case "$fix" in
+  puppetdb-auth)
+    case "$action" in
+      check) grep -q 'allow: "\*"' "$auth" ;;
+      apply) sed -i 's/allow: "\*"/allow-unauthenticated: true/' "$auth" ;;
+    esac
+    ;;
+  puppetboard-index)
+    f="$pb/views/index.py"
+    old=$(cat <<'OLD'
+        num_nodes = get_or_abort(puppetdb.metric, f"{prefix}:name=num-nodes")
+        num_resources = get_or_abort(puppetdb.metric, f"{prefix}:name=num-resources")
+        metrics['num_nodes'] = num_nodes['Value']
+        metrics['num_resources'] = num_resources['Value']
+OLD
+)
+    new=$(cat <<'NEW'
+        try:
+            num_nodes = puppetdb.metric(f"{prefix}:name=num-nodes")
+        except Exception:
+            num_nodes = {'Value': 0}
+        try:
+            num_resources = puppetdb.metric(f"{prefix}:name=num-resources")
+        except Exception:
+            num_resources = {'Value': 0}
+        metrics['num_nodes'] = num_nodes['Value']
+        metrics['num_resources'] = num_resources['Value']
+NEW
+)
+    case "$action" in
+      check) ! grep -qF "num_nodes = {'Value': 0}" "$f" ;;
+      apply) replace "$f" "$old" "$new" ;;
+    esac
+    ;;
+  puppetboard-dailychart)
+    f="$pb/views/dailychart.py"
+    old='today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=UTC())'
+    new='today = datetime.now(UTC()).replace(hour=0, minute=0, second=0, microsecond=0)'
+    case "$action" in
+      check) ! grep -qF "$new" "$f" ;;
+      apply) replace "$f" "$old" "$new" ;;
+    esac
+    ;;
+  *)
+    echo "unknown fix: $fix" >&2
+    exit 2
+    ;;
+esac
