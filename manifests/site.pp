@@ -14,6 +14,7 @@ node 'cli-docker.lab.local'   { include role::standard_server
                                  include profile::nfs_media
                                  include profile::arr_stack
                                  include profile::tautulli
-                                 include profile::seerr }
+                                 include profile::seerr
+                                 include profile::cloudflare_ddns }
 
 node default                  { include role::standard_server }

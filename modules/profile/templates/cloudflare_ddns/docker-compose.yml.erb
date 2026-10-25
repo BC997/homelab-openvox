@@ -1,0 +1,19 @@
+# Managed by OpenVox (profile::cloudflare_ddns). Do not hand edit.
+services:
+  cloudflare-ddns:
+    image: favonia/cloudflare-ddns:<%= @image_tag %>
+    container_name: cloudflare-ddns
+    network_mode: host
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - all
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - .env
+    environment:
+      - DOMAINS=<%= @domains %>
+      - PROXIED=false
+      - IP6_PROVIDER=none
