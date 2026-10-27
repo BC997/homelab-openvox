@@ -1,4 +1,7 @@
-class base::dns {
+class base::dns (
+  String $openvox_primary_fqdn = 'openvox-cli.lab.local',
+  String $openvox_primary_ip   = '10.0.0.10',
+) {
   file { '/etc/systemd/resolved.conf.d':
     ensure => directory,
     owner  => 'root',
@@ -19,5 +22,13 @@ class base::dns {
   service { 'systemd-resolved':
     ensure => running,
     enable => true,
+  }
+
+  # Pin the OpenVox primary in /etc/hosts so agent runs never depend on Pi-hole.
+  # Pi-hole runs on the Docker host, which reboots nightly; agent runs during
+  # that window failed with "Temporary failure in name resolution".
+  host { $openvox_primary_fqdn:
+    ensure => present,
+    ip     => $openvox_primary_ip,
   }
 }

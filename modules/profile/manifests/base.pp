@@ -1,5 +1,7 @@
 class profile::base (
   Boolean       $manage_nightly_reboot = true,
+  String        $nightly_reboot_hour   = '5',
+  String        $nightly_reboot_minute = '0',
   Array[String] $firewall_extra_allow  = [],
   Array[String] $firewall_extra_ports  = [],
   Boolean       $manage_firewall       = true,
@@ -55,14 +57,15 @@ class profile::base (
     minute  => '0',
     weekday => '0',
   }
-  # Nightly reboot - 5AM (disabled on control-plane nodes via profile::base::manage_nightly_reboot: false)
+  # Nightly reboot, 5:00 by default. Time and opt out are set per node in Hiera
+  # (profile::base::nightly_reboot_hour / _minute, profile::base::manage_nightly_reboot)
   if $manage_nightly_reboot {
     cron { 'nightly-reboot':
       ensure  => present,
       command => '/sbin/reboot',
       user    => 'root',
-      hour    => '5',
-      minute  => '0',
+      hour    => $nightly_reboot_hour,
+      minute  => $nightly_reboot_minute,
     }
   } else {
     cron { 'nightly-reboot':

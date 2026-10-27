@@ -58,6 +58,8 @@ The Docker host adds service profiles in site.pp on top of its role, and the pri
 
 **Enforcing what already works.** `base::time` keeps Ubuntu's built in `systemd-timesyncd` enabled and running on every node. Chrony was evaluated and dropped, since timesyncd already holds sub millisecond offsets.
 
+**Keeping agent runs independent of DNS.** Pi-hole runs on the Docker host, and that host reboots nightly. Agent runs that landed in the few minutes it was down failed with "Temporary failure in name resolution," because every node looked up the primary through Pi-hole. `base::dns` now pins the primary's name in `/etc/hosts` on every node with a `host` resource, so agent runs never need DNS to reach the server. The Docker host also reboots at 4:30, 30 minutes ahead of the Plex host, so Pi-hole is back before anything else restarts. Both the address and the reboot time are Hiera parameters.
+
 **Explicit state removal.** When a feature is turned off in Hiera, the profile sets `ensure => absent` instead of just skipping the resource. Skipping would leave an already applied resource in place. The nightly reboot cron is the example here.
 
 ## Secrets

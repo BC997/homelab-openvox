@@ -17,3 +17,6 @@ profile::arr_stack::compose_dir: '/home/ubuntu/docker/arrs'
 # containers reach other services via the host's LAN IP)
 profile::base::firewall_extra_allow:
   - '172.16.0.0/12'
+# Reboot at 4:30, 30 min before the Plex host (5:00), so Pi-hole is back up first
+profile::base::nightly_reboot_hour: '4'
+profile::base::nightly_reboot_minute: '30'
