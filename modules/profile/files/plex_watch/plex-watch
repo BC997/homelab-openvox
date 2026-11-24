@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""plex-watch: report real buffering and playback errors on REMOTE Plex streams
+to Home Assistant, with the likely cause.
+
+Managed by OpenVox (profile::plex_watch). Do not edit on the host.
+
+How it works
+  * Listens to Plex's local websocket for play session state changes, so a
+    short buffer is not missed between polls.
+  * Ignores what a person did on purpose: pauses, the first seconds after a
+    play start, a resume, or any seek (each seek restarts the ignore window,
+    so a run of 10 second skips never alerts).
+  * Only remote (WAN) sessions are reported. LAN viewers are skipped.
+  * On a real buffer, reads /status/sessions for that session (transcode
+    speed, throttled, hardware flags, relay, source vs stream) plus plex-cli
+    CPU and recent Plex log errors, picks a likely cause, and posts one report
+    to the HA webhook "Plex Stream Problem".
+  * Follows the Plex log live (it only keeps about 4 hours on disk).
+
+The Plex token is read from Plex's own Preferences.xml at run time, so no
+token is stored in OpenVox or on disk anywhere else.
+
+Usage
+  plex-watch            run the service (systemd)
+  plex-watch --check    print current sessions as plex-watch sees them
+  plex-watch --test     send a TEST report to Home Assistant
+"""
+
+import argparse
+import collections
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+
+PLEX_URL = os.environ.get("PLEX_URL", "http://127.0.0.1:32400")
+PMS_DIR = "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server"
+PREFS = os.environ.get("PLEX_PREFS", PMS_DIR + "/Preferences.xml")
+LOGFILE = os.environ.get("PLEX_LOG", PMS_DIR + "/Logs/Plex Media Server.log")
+WEBHOOK = os.environ.get("HA_WEBHOOK_URL", "")
+if not WEBHOOK:  # run by hand with sudo: read the same file systemd uses
+    try:
+        with open("/etc/default/plex-watch") as _fh:
+            for _line in _fh:
+                if _line.startswith("HA_WEBHOOK_URL="):
+                    WEBHOOK = _line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+HOST = "plex-cli"
+
+START_GRACE = float(os.environ.get("START_GRACE", "15"))   # s after play start
+SEEK_GRACE = float(os.environ.get("SEEK_GRACE", "15"))     # s after seek/resume
+SEEK_JUMP_MS = int(os.environ.get("SEEK_JUMP_MS", "4000"))  # offset jump = seek
+MIN_BUFFER = float(os.environ.get("MIN_BUFFER", "2"))      # ignore blips shorter
+LONG_BUFFER = float(os.environ.get("LONG_BUFFER", "10"))   # report while still buffering
+COOLDOWN = float(os.environ.get("COOLDOWN", "120"))        # per session, buffering
+ERROR_WINDOW = float(os.environ.get("ERROR_WINDOW", "30"))  # log lines this recent
+
+ERROR_RE = re.compile(r"\bERROR\b")
+MEDIA_RE = re.compile(
+    r"(I/O error|Input/output error|Stale file handle|No such file|"
+    r"Error opening|could not open|Permission denied|Invalid data found)",
+    re.I,
+)
+REDACT_RE = re.compile(r"((?:X-Plex-Token|token)=)[^&\s\"']+", re.I)
+LOG_TS_RE = re.compile(r"^\w{3} \d{1,2}, \d{4} \d{2}:\d{2}:\d{2}")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def redact(text):
+    return REDACT_RE.sub(r"\1REDACTED", text)
+
+
+# ---------------------------------------------------------------- Plex access
+
+def plex_token():
+    root = ET.parse(PREFS).getroot()
+    token = root.attrib.get("PlexOnlineToken", "")
+    if not token:
+        raise RuntimeError("PlexOnlineToken not found in Preferences.xml")
+    return token
+
+
+class Plex:
+    def __init__(self):
+        self.token = plex_token()
+
+    def get(self, path):
+        req = urllib.request.Request(
+            PLEX_URL + path,
+            headers={"X-Plex-Token": self.token, "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:  # token changed, read it again once
+                self.token = plex_token()
+                req.add_header("X-Plex-Token", self.token)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return json.load(resp)
+            raise
+
+    def sessions(self):
+        data = self.get("/status/sessions")
+        out = {}
+        for item in data.get("MediaContainer", {}).get("Metadata", []) or []:
+            key = str(item.get("sessionKey", ""))
+            if not key:
+                continue
+            # While transcoding, the session's Media describes the OUTPUT.
+            # Look up the library item so the report shows the real file.
+            if item.get("TranscodeSession") and item.get("ratingKey"):
+                try:
+                    lib = self.get(f"/library/metadata/{item['ratingKey']}")
+                    lib_items = lib.get("MediaContainer", {}).get("Metadata", []) or []
+                    if lib_items and lib_items[0].get("Media"):
+                        item["_source"] = lib_items[0]["Media"][0]
+                except Exception as exc:
+                    log(f"could not read library item {item.get('ratingKey')}: {exc}")
+            out[key] = item
+        return out
+
+
+# ------------------------------------------------------------- host readings
+
+def cpu_percent(interval=0.5):
+    def snap():
+        with open("/proc/stat") as fh:
+            parts = [int(x) for x in fh.readline().split()[1:]]
+        idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+        return idle, sum(parts)
+
+    i1, t1 = snap()
+    time.sleep(interval)
+    i2, t2 = snap()
+    total = t2 - t1
+    return round(100.0 * (1 - (i2 - i1) / total)) if total > 0 else None
+
+
+class LogFollower(threading.Thread):
+    """Follows the Plex log live and keeps recent ERROR lines in memory."""
+
+    def __init__(self, path):
+        super().__init__(daemon=True)
+        self.path = path
+        self.errors = collections.deque(maxlen=300)
+        self.lock = threading.Lock()
+
+    def run(self):
+        fh, inode = None, None
+        while True:
+            try:
+                if fh is None:
+                    fh = open(self.path, "r", errors="replace")
+                    fh.seek(0, os.SEEK_END)
+                    inode = os.fstat(fh.fileno()).st_ino
+                line = fh.readline()
+                if line:
+                    if ERROR_RE.search(line):
+                        with self.lock:
+                            self.errors.append((time.time(), redact(line.strip())))
+                    continue
+                time.sleep(0.5)
+                st = os.stat(self.path)
+                if st.st_ino != inode or st.st_size < fh.tell():
+                    fh.close()  # rotated: start again at the top of the new file
+                    fh = open(self.path, "r", errors="replace")
+                    inode = os.fstat(fh.fileno()).st_ino
+            except FileNotFoundError:
+                fh = None
+                time.sleep(2)
+            except Exception as exc:  # keep following no matter what
+                log(f"log follower: {exc}")
+                fh = None
+                time.sleep(5)
+
+    def recent(self, seconds=ERROR_WINDOW):
+        cutoff = time.time() - seconds
+        with self.lock:
+            return [line for ts, line in self.errors if ts >= cutoff]
+
+
+# ------------------------------------------------------------ describe/cause
+
+def _num(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def describe(meta):
+    """Turn a /status/sessions entry into the report fields."""
+    player = meta.get("Player", {}) or {}
+    session = meta.get("Session", {}) or {}
+    out_media = (meta.get("Media") or [{}])[0]          # what is being sent
+    media = meta.get("_source") or out_media             # the file itself
+    ts = meta.get("TranscodeSession") or {}
+
+    if meta.get("type") == "episode":
+        title = f"{meta.get('grandparentTitle', '')} - {meta.get('title', '')}"
+    elif meta.get("year"):
+        title = f"{meta.get('title', '')} ({meta.get('year')})"
+    else:
+        title = meta.get("title", "unknown title")
+
+    res = media.get("videoResolution", "")
+    res = f"{res.upper()}" if res.lower() == "4k" else (f"{res}p" if res.isdigit() else res)
+    src_codec = (media.get("videoCodec") or "").upper()
+    src_rate = _num(media.get("bitrate"))
+    source = " ".join(x for x in [res, src_codec] if x)
+    if src_rate:
+        source += f", {src_rate / 1000:.1f} Mbps"
+
+    if not ts:
+        decision = "direct play"
+    elif ts.get("videoDecision") == "transcode" or ts.get("audioDecision") == "transcode":
+        decision = "transcode"
+    else:
+        decision = "direct stream"
+
+    stream = "unchanged"
+    reasons = []
+    if ts:
+        height = ts.get("height")
+        out_res = out_media.get("videoResolution", "")
+        out_res = f"{out_res}p" if out_res.isdigit() else out_res.upper()
+        out_codec = (ts.get("videoCodec") or out_media.get("videoCodec") or "").upper()
+        out_rate = _num(out_media.get("bitrate"))
+        stream = " ".join(x for x in [f"{height}p" if height else out_res, out_codec] if x) or "transcoded"
+        if out_rate:
+            stream += f", {out_rate / 1000:.1f} Mbps"
+        if ts.get("subtitleDecision") == "burn":
+            reasons.append("subtitle burn in")
+        if ts.get("videoDecision") == "transcode":
+            in_codec = (ts.get("sourceVideoCodec") or media.get("videoCodec") or "").upper()
+            if src_rate and out_rate and out_rate < src_rate * 0.8:
+                reasons.append(f"quality set lower than the file "
+                               f"({src_rate / 1000:.1f} to {out_rate / 1000:.1f} Mbps)")
+            elif in_codec and out_codec and in_codec != out_codec:
+                reasons.append(f"player likely can't play {in_codec}")
+            else:
+                reasons.append("player or quality limits")
+        if ts.get("audioDecision") == "transcode":
+            src_audio = (ts.get("sourceAudioCodec") or media.get("audioCodec") or "").upper()
+            out_audio = (ts.get("audioCodec") or "").upper()
+            reasons.append(" ".join(x for x in ["audio", src_audio, "to " + out_audio if out_audio else "converted"] if x))
+
+    bandwidth = _num(session.get("bandwidth"))
+    duration = _num(meta.get("duration"))
+    offset = _num(meta.get("viewOffset"))
+    relayed = str(player.get("relayed", "")).lower() in ("1", "true")
+
+    return {
+        "user": (meta.get("User") or {}).get("title", "Someone"),
+        "player": player.get("title") or player.get("product") or "a player",
+        "product": player.get("product", ""),
+        "title": title,
+        "location": session.get("location") or ("lan" if player.get("local") else "wan"),
+        "relayed": relayed,
+        "decision": decision,
+        "transcode_reason": "; ".join(reasons),
+        "speed": _num(ts.get("speed")),
+        "throttled": bool(ts.get("throttled")),
+        "hw": bool(ts.get("transcodeHwDecoding") or ts.get("transcodeHwEncoding")),
+        "source": source,
+        "stream": stream,
+        "reserved_mbps": round(bandwidth / 1000, 1) if bandwidth else None,
+        "progress_pct": round(offset / duration * 100) if offset and duration else None,
+    }
+
+
+def stream_signature(meta):
+    """What is being sent. Changes when the viewer switches quality."""
+    ts = meta.get("TranscodeSession") or {}
+    out = (meta.get("Media") or [{}])[0]
+    return (bool(ts), ts.get("videoDecision"), ts.get("audioDecision"),
+            out.get("bitrate"), out.get("videoResolution"))
+
+
+def pick_cause(event, info, errors):
+    media_errors = [e for e in errors if MEDIA_RE.search(e)]
+    if event == "error":
+        return "media" if media_errors else "error"
+    if info["relayed"]:
+        return "relay"
+    if info["decision"] == "transcode" and info["speed"] is not None \
+            and info["speed"] < 1.0 and not info["throttled"]:
+        return "server"
+    if media_errors:
+        return "media"
+    return "viewer"
+
+
+# ----------------------------------------------------------------- reporting
+
+def post(payload):
+    if not WEBHOOK:
+        log("HA_WEBHOOK_URL is not set, not sending")
+        return False
+    req = urllib.request.Request(
+        WEBHOOK,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log(f"sent {payload['event']} report for {payload.get('user')} "
+                f"({payload.get('cause')}), HA answered {resp.status}")
+            return True
+    except Exception as exc:
+        log(f"could not reach HA: {exc}")
+        return False
+
+
+# ------------------------------------------------------- session state logic
+
+class SessionState:
+    def __init__(self, now):
+        self.state = None
+        self.offset = 0
+        self.ts = now
+        self.ignore_until = now + START_GRACE
+        self.buf_start = None
+        self.buf_ignored = False
+        self.buf_reported = False
+        self.last_report = 0.0
+        self.suppressed = 0
+        self.meta = None
+        self.meta_ts = 0.0
+        self.ignore_why = "play start"
+        self.tkey = None
+
+
+class Watcher:
+    """Pure state machine; I/O is injected so it can be tested."""
+
+    def __init__(self, get_sessions, send, get_errors, get_cpu, clock=time.time):
+        self.get_sessions = get_sessions
+        self.send = send
+        self.get_errors = get_errors
+        self.get_cpu = get_cpu
+        self.clock = clock
+        self.sessions = {}
+        self.lock = threading.Lock()
+
+    # --- websocket input
+    def on_message(self, raw):
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return
+        cont = msg.get("NotificationContainer", {})
+        if cont.get("type") != "playing":
+            return
+        for note in cont.get("PlaySessionStateNotification", []) or []:
+            self.handle(note)
+
+    def handle(self, note):
+        key = str(note.get("sessionKey", ""))
+        if not key:
+            return
+        state = note.get("state", "")
+        offset = int(_num(note.get("viewOffset")) or 0)
+        now = self.clock()
+        with self.lock:
+            s = self.sessions.get(key)
+            if s is None:
+                s = self.sessions[key] = SessionState(now)
+                s.ignore_why = "play start"
+            else:
+                # seek: position moved more than playback could explain
+                if s.state == "playing":
+                    expected = s.offset + (now - s.ts) * 1000
+                else:
+                    expected = s.offset
+                if abs(offset - expected) > SEEK_JUMP_MS:
+                    s.ignore_until = max(s.ignore_until, now + SEEK_GRACE)
+                    s.ignore_why = "seek"
+                # resume after a pause is a person's action too
+                if s.state == "paused" and state in ("playing", "buffering"):
+                    s.ignore_until = max(s.ignore_until, now + SEEK_GRACE)
+                    s.ignore_why = "resume"
+
+            # quality change: the transcode session appears, goes away or changes
+            tkey = str(note.get("transcodeSession") or "")
+            if s.tkey is not None and tkey != s.tkey:
+                s.ignore_until = max(s.ignore_until, now + SEEK_GRACE)
+                s.ignore_why = "quality change"
+            s.tkey = tkey
+
+            if state != s.state and state in ("playing", "paused", "stopped"):
+                log(f"session {key}: {state}")
+            report = None
+            if state == "buffering":
+                if s.buf_start is None:
+                    s.buf_start = now
+                    s.buf_ignored = now < s.ignore_until
+                    s.buf_reported = False
+                    if s.buf_ignored:
+                        log(f"session {key}: buffering ignored ({s.ignore_why})")
+            elif s.buf_start is not None:
+                dur = now - s.buf_start
+                if not s.buf_ignored and not s.buf_reported and dur >= MIN_BUFFER:
+                    report = ("buffering", round(dur))
+                s.buf_start = None
+
+            if state == "error":
+                report = ("error", None)
+
+            # a stop right after a transcoder or file error counts as a failure
+            if state == "stopped" and report is None:
+                was_transcoding = bool(s.meta and s.meta.get("TranscodeSession"))
+                for err in self.get_errors():
+                    if MEDIA_RE.search(err) or (was_transcoding and "ranscode" in err):
+                        report = ("error", None)
+                        break
+
+            s.state, s.offset, s.ts = state, offset, now
+            if state == "stopped":
+                self.sessions.pop(key, None)
+            refresh = state != "stopped" and now - s.meta_ts > 30
+
+        if report:
+            self.report(key, s, *report)
+        elif refresh:
+            # keep details cached, so a stop after an error can still be described
+            try:
+                meta = self.get_sessions().get(key)
+                if meta:
+                    s.meta, s.meta_ts = meta, now
+            except Exception as exc:
+                log(f"could not read /status/sessions: {exc}")
+
+    def tick(self):
+        """Called every couple of seconds: catches long buffering with no
+        further notification from Plex."""
+        now = self.clock()
+        due = []
+        with self.lock:
+            for key, s in self.sessions.items():
+                if s.buf_start is not None and not s.buf_ignored and not s.buf_reported \
+                        and now - s.buf_start >= LONG_BUFFER:
+                    s.buf_reported = True
+                    due.append((key, s, round(now - s.buf_start)))
+        for key, s, dur in due:
+            self.report(key, s, "buffering", dur, ongoing=True)
+
+    def report(self, key, s, event, dur, ongoing=False):
+        now = self.clock()
+        meta = None
+        try:
+            meta = self.get_sessions().get(key)
+        except Exception as exc:
+            log(f"could not read /status/sessions: {exc}")
+        meta = meta or s.meta
+        if meta is None:
+            log(f"session {key}: {event} but no session details, skipped")
+            return
+        old_meta, old_ts = s.meta, s.meta_ts
+        s.meta, s.meta_ts = meta, now
+        if event == "buffering" and old_meta is not None and now - old_ts < 90 \
+                and stream_signature(old_meta) != stream_signature(meta):
+            log(f"session {key}: buffering ignored (quality change)")
+            return
+        info = describe(meta)
+        if info["location"] != "wan":
+            return  # LAN viewers are not reported (BC's choice)
+        if event == "buffering" and now - s.last_report < COOLDOWN:
+            s.suppressed += 1
+            return
+        s.last_report = now
+        errors = self.get_errors()
+        payload = {
+            "host": HOST,
+            "test": False,
+            "event": event,
+            "cause": pick_cause(event, info, errors),
+            "cpu_pct": self.get_cpu(),
+            "error": (errors[-1][:300] if errors else ""),
+        }
+        payload.update({k: v for k, v in info.items() if k != "relayed"})
+        if dur is not None:
+            payload["buffer_s"] = dur
+        notes = []
+        if ongoing:
+            notes.append("still buffering")
+        if s.suppressed:
+            notes.append(f"{s.suppressed} more buffers since the last alert")
+            s.suppressed = 0
+        if notes:
+            payload["error"] = "; ".join(x for x in [payload["error"]] + notes if x)
+        payload = {k: v for k, v in payload.items() if v is not None}
+        self.send(payload)
+
+
+# ---------------------------------------------------------------------- main
+
+def run_service():
+    import websocket  # python3-websocket, installed by profile::plex_watch
+
+    follower = LogFollower(LOGFILE)
+    follower.start()
+    plex = Plex()
+    watcher = Watcher(plex.sessions, post, follower.recent, cpu_percent)
+
+    def ticker():
+        while True:
+            time.sleep(2)
+            try:
+                watcher.tick()
+            except Exception as exc:
+                log(f"tick: {exc}")
+
+    threading.Thread(target=ticker, daemon=True).start()
+    log("plex-watch started")
+
+    while True:
+        try:
+            plex.token = plex_token()
+            url = PLEX_URL.replace("http", "ws", 1) + \
+                "/:/websockets/notifications?X-Plex-Token=" + plex.token
+            app = websocket.WebSocketApp(
+                url,
+                on_open=lambda ws: log("connected to Plex"),
+                on_message=lambda ws, m: watcher.on_message(m),
+                on_error=lambda ws, e: log(f"websocket: {redact(str(e))}"),
+                on_close=lambda ws, c, r: log("Plex connection closed"),
+            )
+            app.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as exc:
+            log(f"websocket loop: {redact(str(exc))}")
+        time.sleep(10)  # Plex restarting (05:00 reboot, updates): try again
+
+
+def run_check():
+    plex = Plex()
+    sessions = plex.sessions()
+    if not sessions:
+        print("No active sessions.")
+    for key, meta in sessions.items():
+        info = describe(meta)
+        print(f"[{key}] {info['user']} on {info['player']}: {info['title']}")
+        print(f"    location {info['location']}, relayed {info['relayed']}, {info['decision']}"
+              f"{' (' + info['transcode_reason'] + ')' if info['transcode_reason'] else ''}")
+        print(f"    source {info['source']} -> {info['stream']}, speed {info['speed']}, "
+              f"throttled {info['throttled']}, GPU {info['hw']}, reserved {info['reserved_mbps']} Mbps")
+    print(f"plex-cli CPU {cpu_percent()}%")
+    print(f"webhook set: {'yes' if WEBHOOK else 'NO'}")
+
+
+def run_test():
+    ok = post({
+        "host": HOST, "test": True, "event": "buffering", "cause": "viewer",
+        "user": "plex-watch", "player": "self test", "title": "Test report from plex-cli",
+        "location": "wan", "decision": "direct play", "source": "test", "stream": "test",
+        "cpu_pct": cpu_percent(), "buffer_s": 0, "progress_pct": 0, "error": "",
+    })
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Report remote Plex buffering to Home Assistant")
+    parser.add_argument("--check", action="store_true", help="print current sessions and exit")
+    parser.add_argument("--test", action="store_true", help="send a TEST report to HA and exit")
+    args = parser.parse_args()
+    if args.check:
+        run_check()
+    elif args.test:
+        run_test()
+    else:
+        run_service()
