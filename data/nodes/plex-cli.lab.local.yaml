@@ -4,3 +4,8 @@ profile::node_exporter::extra_args: "--collector.systemd --collector.systemd.uni
 # everything else on this node stays LAN-only
 profile::base::firewall_extra_ports:
   - '32400'
+# No nightly reboot (Nov 2026): replaced by the Patch Wednesday 03:45 conditional reboot
+profile::base::manage_nightly_reboot: false
+# Patch Wednesday: reboot Wed 03:45 only if /var/run/reboot-required exists
+profile::patch_reboot::ensure: 'present'
+profile::patch_reboot::time: '03:45'

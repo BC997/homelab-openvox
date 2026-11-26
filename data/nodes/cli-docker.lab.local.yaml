@@ -17,6 +17,13 @@ profile::arr_stack::compose_dir: '/home/ubuntu/docker/arrs'
 # containers reach other services via the host's LAN IP)
 profile::base::firewall_extra_allow:
   - '172.16.0.0/12'
-# Reboot at 4:30, 30 min before the Plex host (5:00), so Pi-hole is back up first
-profile::base::nightly_reboot_hour: '4'
-profile::base::nightly_reboot_minute: '30'
+# No nightly reboot: Patch Wednesday reboots this host only when a reboot is pending
+profile::base::manage_nightly_reboot: false
+# Patch Wednesday: reboot Wed 04:15 only if /var/run/reboot-required exists.
+# Last in the window: it carries Pi-hole DNS and every container.
+profile::patch_reboot::ensure: 'present'
+profile::patch_reboot::time: '04:15'
+# Post boot container check (profile::container_check): 19 unless-stopped
+# containers; the five disabled ones (restart policy no) are ignored.
+# ha_webhook_url comes from cli-docker.lab.local.eyaml.
+profile::container_check::expected_count: 19

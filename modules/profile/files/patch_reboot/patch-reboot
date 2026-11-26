@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+# Managed by Open Source Puppet (profile::patch_reboot)
+"""Patch Wednesday: reboot this VM only if a reboot is pending.
+
+Run once a week by patch-reboot.timer in this VM's slot. Reboots only when
+/var/run/reboot-required exists, the dpkg locks are free, and the VM has been
+up at least MIN_UPTIME_MINUTES. If a dpkg lock is held (apt, dpkg or
+unattended-upgrades is working), it rechecks every 5 minutes for up to 10
+minutes, then gives up for this week, so the reboot stays inside its 15
+minute slot. If it skips, reboot-watch still alerts
+once the flag is 48 hours old.
+
+Must run as root: the lock test opens the dpkg lock files read-write.
+
+  patch-reboot            check and reboot if needed (what the timer runs)
+  patch-reboot --dry-run  check once, print the decision, never wait or reboot
+"""
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+FLAG = '/var/run/reboot-required'
+PKGS = '/var/run/reboot-required.pkgs'
+# The same locks apt and dpkg take (fcntl record locks). Holding either means
+# a package operation is running.
+DPKG_LOCKS = ('/var/lib/dpkg/lock-frontend', '/var/lib/dpkg/lock')
+RETRY_EVERY_S = 5 * 60
+RETRY_FOR_S = 10 * 60  # stays inside the VM's 15 minute slot
+MIN_UPTIME_S = int(os.environ.get('MIN_UPTIME_MINUTES', '30')) * 60
+
+
+def uptime_s():
+    with open('/proc/uptime') as f:
+        return float(f.read().split()[0])
+
+
+def dpkg_lock_held():
+    """Return the first dpkg lock that is held (or can't be tested), else ''.
+
+    Takes each lock with a non-blocking fcntl lock and releases it at once,
+    so a package run that starts a moment later is never blocked by us.
+    """
+    for path in DPKG_LOCKS:
+        try:
+            fd = os.open(path, os.O_RDWR)  # no O_CREAT: a missing file is free
+        except FileNotFoundError:
+            continue
+        except OSError as err:  # not root, or another error: treat as busy
+            return f'{path} (could not open: {err.strerror})'
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return path
+        else:
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    return ''
+
+
+def pending_pkgs():
+    try:
+        with open(PKGS) as f:
+            return sorted({line.strip() for line in f if line.strip()})
+    except OSError:
+        return []
+
+
+def main():
+    dry = len(sys.argv) > 1 and sys.argv[1] == '--dry-run'
+
+    if not os.path.exists(FLAG):
+        print('No reboot pending, nothing to do')
+        return 0
+
+    pkgs = ', '.join(pending_pkgs()) or 'none listed'
+
+    deadline = time.monotonic() + RETRY_FOR_S
+    held = dpkg_lock_held()
+    while held:
+        if dry or time.monotonic() >= deadline:
+            print(f'Reboot pending ({pkgs}) but skipped: {held} is held'
+                  + ('' if dry else f' after {RETRY_FOR_S // 60} min of retries'))
+            return 0
+        print(f'{held} is held, rechecking in {RETRY_EVERY_S // 60} min')
+        sys.stdout.flush()
+        time.sleep(RETRY_EVERY_S)
+        held = dpkg_lock_held()
+
+    up = uptime_s()
+    if up < MIN_UPTIME_S:
+        print(f'Reboot pending ({pkgs}) but skipped: up only {int(up // 60)} min, '
+              f'minimum is {MIN_UPTIME_S // 60} min')
+        return 0
+
+    if dry:
+        print(f'Dry run: would reboot now. Waiting on: {pkgs}')
+        return 0
+
+    print(f'Rebooting for pending updates: {pkgs}')
+    sys.stdout.flush()
+    return subprocess.run(['/usr/bin/systemctl', 'reboot'], check=False).returncode
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -4,3 +4,6 @@ profile::openvox_primary::autosign_certnames:
   - 'openvox-cli.lab.local'
   - 'plex-cli.lab.local'
   - 'cli-docker.lab.local'
+# Patch Wednesday: reboot Wed 03:30 only if /var/run/reboot-required exists (first in the window)
+profile::patch_reboot::ensure: 'present'
+profile::patch_reboot::time: '03:30'

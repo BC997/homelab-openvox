@@ -9,6 +9,7 @@ node 'plex-cli.lab.local'     { include role::media_server }
 
 node 'cli-docker.lab.local'   { include role::standard_server
                                  include profile::docker
+                                 include profile::container_check
                                  include profile::prometheus_env
                                  include profile::pihole_env
                                  include profile::nfs_media

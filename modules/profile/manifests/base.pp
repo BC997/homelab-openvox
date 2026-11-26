@@ -11,6 +11,7 @@ class profile::base (
 ) {
   include base
   include profile::node_exporter
+  include profile::patch_reboot
 
   class { 'base::firewall':
     ensure              => $manage_firewall ? { true => 'enabled', false => 'disabled' },
@@ -48,17 +49,17 @@ class profile::base (
     content => "${admin_user} ALL=(ALL) NOPASSWD: ALL\n",
     require => User[$admin_user],
   }
-  # Weekly apt upgrade - Sunday 1AM
+  # Weekly apt upgrade - Wednesday 1AM (Patch Wednesday, moved from Sunday Nov 2026)
   cron { 'weekly-apt-upgrade':
     ensure  => present,
     command => '/usr/bin/apt-get update && /usr/bin/apt-get -y upgrade',
     user    => 'root',
     hour    => '1',
     minute  => '0',
-    weekday => '0',
+    weekday => '3',
   }
-  # Nightly reboot, 5:00 by default. Time and opt out are set per node in Hiera
-  # (profile::base::nightly_reboot_hour / _minute, profile::base::manage_nightly_reboot)
+  # Nightly reboot - 5AM. Off on every VM since Nov 2026 (Patch Wednesday, profile::patch_reboot).
+  # Kept as an option; a node turns it on with profile::base::manage_nightly_reboot: true.
   if $manage_nightly_reboot {
     cron { 'nightly-reboot':
       ensure  => present,
